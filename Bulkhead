@@ -1,0 +1,692 @@
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading;
+
+namespace OopMonitoringLab
+{
+    public class Request
+    {
+        public string ServiceName { get; set; } = string.Empty;
+        public int PayloadSize { get; set; }
+        public int? DeadlineMs { get; set; }
+        public int Priority { get; set; } = 1;
+        public string TraceId { get; set; } = Guid.NewGuid().ToString();
+
+        public Request(string serviceName, int payloadSize, int? deadlineMs = null, int priority = 1)
+        {
+            ServiceName = serviceName;
+            PayloadSize = payloadSize;
+            DeadlineMs = deadlineMs;
+            Priority = priority;
+        }
+        
+        public override string ToString()
+        {
+            return $"{ServiceName}[Size:{PayloadSize}, Prio:{Priority}, Deadline:{DeadlineMs?.ToString() ?? "None"}]";
+        }
+    }
+
+    public class Response
+    {
+        public bool IsSuccess { get; set; }
+        public int LatencyMs { get; set; }
+        public string? ErrorCode { get; set; }
+        public string? ErrorMessage { get; set; }
+        public string? ServiceName { get; set; }
+        public string TraceId { get; set; } = string.Empty;
+
+        public Response(bool isSuccess, int latencyMs, string? errorCode = null,
+                       string? errorMessage = null, string? serviceName = null, string traceId = "")
+        {
+            IsSuccess = isSuccess;
+            LatencyMs = latencyMs;
+            ErrorCode = errorCode;
+            ErrorMessage = errorMessage;
+            ServiceName = serviceName;
+            TraceId = traceId;
+        }
+
+        public override string ToString()
+        {
+            return IsSuccess
+                ? $"Success in {LatencyMs}ms"
+                : $"Failed in {LatencyMs}ms: {ErrorCode} - {ErrorMessage}";
+        }
+    }
+
+//интерфейс сервиса
+    public interface IService
+    {
+        string Name { get; }
+        int BaseLatencyMs { get; }
+        double FailureProbability { get; }
+        int MaxConcurrentRequests { get; }
+        int CurrentConcurrentRequests { get; }
+
+        Response Process(Request request);
+        bool CanAcceptRequest();
+    }
+
+//базовый класс сервиса
+    public abstract class ServiceBase : IService
+    {
+        private static readonly Random _random = new Random();
+        private int _currentRequests = 0;
+
+        public string Name { get; protected set; }
+        public int BaseLatencyMs { get; protected set; }
+        public double FailureProbability { get; protected set; }
+        public int MaxConcurrentRequests { get; protected set; } = 3;
+
+        public int CurrentConcurrentRequests => _currentRequests;
+
+        protected ServiceBase(string name, int baseLatencyMs, double failureProbability, int maxConcurrent = 3)
+        {
+            Name = name;
+            BaseLatencyMs = baseLatencyMs;
+            FailureProbability = failureProbability;
+            MaxConcurrentRequests = maxConcurrent;
+        }
+
+        public virtual bool CanAcceptRequest()
+        {
+            return _currentRequests < MaxConcurrentRequests;
+        }
+
+        public virtual Response Process(Request request)
+        {
+            if (!CanAcceptRequest())
+            {
+                return new Response(false, 0, "Bulkhead_Full",
+                    $"Service {Name} reached concurrent limit ({MaxConcurrentRequests})",
+                    Name, request.TraceId);
+            }
+            try
+            {
+                Interlocked.Increment(ref _currentRequests);
+                int latencyVariation = (int)(BaseLatencyMs * (_random.NextDouble() - 0.5));
+                int actualLatency = Math.Max(10, BaseLatencyMs + latencyVariation);
+
+                if (request.DeadlineMs.HasValue && actualLatency > request.DeadlineMs.Value)
+                {
+                    Thread.Sleep(10);
+                    var timeoutResponse = new Response(false, actualLatency, "Timeout",
+                        $"Request exceeded deadline {request.DeadlineMs}ms", Name, request.TraceId);
+                    Log(request, timeoutResponse);
+                    return timeoutResponse;
+                }
+
+                Thread.Sleep(Math.Min(actualLatency, 50));
+
+                bool isSuccess = _random.NextDouble() > FailureProbability;
+
+                Response response;
+                if (isSuccess)
+                {
+                    response = new Response(true, actualLatency, null, null, Name, request.TraceId);
+                }
+                else
+                {
+                    response = new Response(false, actualLatency, "Service_Error",
+                        $"Service {Name} failed with probability {FailureProbability}",
+                        Name, request.TraceId);
+                }
+
+                Log(request, response);
+                return response;
+            }
+            finally
+            {
+                Interlocked.Decrement(ref _currentRequests);
+            }
+        }
+
+        protected virtual void Log(Request request, Response response)
+        {
+            Console.ForegroundColor = response.IsSuccess ? ConsoleColor.Green : ConsoleColor.Red;
+            Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] {Name} processed {request}");
+            Console.WriteLine($"       -> {response}");
+            Console.ResetColor();
+        }
+    }
+
+    public class FastService : ServiceBase
+    {
+        public FastService()
+            : base("FastService", baseLatencyMs: 50, failureProbability: 0.05, maxConcurrent: 2)
+        {
+        }
+
+        public override Response Process(Request request)
+        {
+            return base.Process(request);
+        }
+    }
+
+    public class SlowService : ServiceBase
+    {
+        public SlowService()
+            : base("SlowService", baseLatencyMs: 200, failureProbability: 0.15, maxConcurrent: 1)
+        {
+        }
+
+        public override Response Process(Request request)
+        {
+            return base.Process(request);
+        }
+    }
+
+    public class BalancedService : ServiceBase
+    {
+        public BalancedService()
+            : base("BalancedService", baseLatencyMs: 100, failureProbability: 0.08, maxConcurrent: 3)
+        {
+        }
+    }
+
+//метрики и сбор наблюдаемости
+    public class ServiceMetrics
+    {
+        public string ServiceName { get; }
+        public int TotalRequests { get; private set; }
+        public int SuccessfulRequests { get; private set; }
+        public int FailedRequests { get; private set; }
+        public int BulkheadRejections { get; private set; }
+        public int TimeoutErrors { get; private set; }
+        public int ServiceErrors { get; private set; }
+
+        private long _totalLatency;
+        public double AverageLatencyMs => TotalRequests > 0 ? (double)_totalLatency / TotalRequests : 0;
+        public int MaxLatencyMs { get; private set; }
+
+        private List<int> _recentLatencies = new List<int>();
+        private const int RECENT_WINDOW_SIZE = 10;
+
+        public ServiceMetrics(string serviceName)
+        {
+            ServiceName = serviceName;
+        }
+
+        public double ErrorRate => TotalRequests > 0 ? (double)FailedRequests / TotalRequests * 100 : 0;
+
+        public void Update(Response response)
+        {
+            TotalRequests++;
+
+            if (response.IsSuccess)
+            {
+                SuccessfulRequests++;
+            }
+            else
+            {
+                FailedRequests++;
+
+                if (response.ErrorCode == "Bulkhead_Full")
+                    BulkheadRejections++;
+                else if (response.ErrorCode == "Timeout")
+                    TimeoutErrors++;
+                else if (response.ErrorCode == "Service_Error")
+                    ServiceErrors++;
+            }
+
+            _totalLatency += response.LatencyMs;
+            MaxLatencyMs = Math.Max(MaxLatencyMs, response.LatencyMs);
+
+            _recentLatencies.Add(response.LatencyMs);
+            if (_recentLatencies.Count > RECENT_WINDOW_SIZE)
+                _recentLatencies.RemoveAt(0);
+        }
+
+        public double GetRecentAverageLatency()
+        {
+            return _recentLatencies.Any() ? _recentLatencies.Average() : 0;
+        }
+
+        public override string ToString()
+        {
+            return $"{ServiceName}: Total={TotalRequests}, Success={SuccessfulRequests}, " +
+                   $"Fail={FailedRequests}, ErrorRate={ErrorRate:F1}%, " +
+                   $"AvgLatency={AverageLatencyMs:F1}ms, MaxLatency={MaxLatencyMs}ms, " +
+                   $"BulkheadRejections={BulkheadRejections}";
+        }
+    }
+
+    public interface IMetricsCollector
+    {
+        void RegisterService(IService service);
+        void Record(Request request, Response response);
+        IReadOnlyCollection<ServiceMetrics> GetCurrentMetrics();
+        ServiceMetrics GetMetrics(string serviceName);
+    }
+
+    public class InMemoryMetricsCollector : IMetricsCollector
+    {
+        private readonly ConcurrentDictionary<string, ServiceMetrics> _metricsByService =
+            new ConcurrentDictionary<string, ServiceMetrics>();
+        private readonly ConcurrentDictionary<string, IService> _services =
+            new ConcurrentDictionary<string, IService>();
+
+        public void RegisterService(IService service)
+        {
+            _services.TryAdd(service.Name, service);
+            _metricsByService.GetOrAdd(service.Name, _ => new ServiceMetrics(service.Name));
+        }
+
+        public void Record(Request request, Response response)
+        {
+            if (_metricsByService.TryGetValue(response.ServiceName ?? request.ServiceName, out var metrics))
+            {
+                metrics.Update(response);
+            }
+            else
+            {
+                var newMetrics = new ServiceMetrics(response.ServiceName ?? request.ServiceName);
+                newMetrics.Update(response);
+                _metricsByService.TryAdd(response.ServiceName ?? request.ServiceName, newMetrics);
+            }
+        }
+
+        public IReadOnlyCollection<ServiceMetrics> GetCurrentMetrics()
+        {
+            return _metricsByService.Values.ToList().AsReadOnly();
+        }
+
+        public ServiceMetrics GetMetrics(string serviceName)
+        {
+            return _metricsByService.TryGetValue(serviceName, out var metrics) ? metrics : null;
+        }
+
+        public IService GetService(string serviceName)
+        {
+            return _services.TryGetValue(serviceName, out var service) ? service : null;
+        }
+    }
+
+    public enum ServiceHealth
+    {
+        Healthy,
+        Degraded,
+        Unhealthy
+    }
+
+    public class ServiceHealthEvaluator
+    {
+        public double MaxHealthyErrorRate { get; set; } = 5.0;
+        public double MaxDegradedErrorRate { get; set; } = 20.0;
+        public int MaxHealthyLatencyMs { get; set; } = 150;
+        public int MaxDegradedLatencyMs { get; set; } = 400;
+        public double MaxBulkheadRejectionRate { get; set; } = 10.0;
+
+        public ServiceHealth Evaluate(ServiceMetrics metrics)
+        {
+            if (metrics.TotalRequests == 0)
+                return ServiceHealth.Healthy;
+
+            double errorRate = metrics.ErrorRate;
+            double bulkheadRejectionRate = metrics.TotalRequests > 0 ?
+                (double)metrics.BulkheadRejections / metrics.TotalRequests * 100 : 0;
+            double avgLatency = metrics.AverageLatencyMs;
+
+            if (errorRate > MaxDegradedErrorRate ||
+                avgLatency > MaxDegradedLatencyMs * 1.5 ||
+                bulkheadRejectionRate > MaxBulkheadRejectionRate * 2)
+            {
+                return ServiceHealth.Unhealthy;
+            }
+            if (errorRate > MaxHealthyErrorRate ||
+                avgLatency > MaxHealthyLatencyMs ||
+                bulkheadRejectionRate > MaxBulkheadRejectionRate)
+            {
+                return ServiceHealth.Degraded;
+            }
+
+            return ServiceHealth.Healthy;
+        }
+
+        public string GetHealthStatusMessage(ServiceMetrics metrics, ServiceHealth health)
+        {
+            return health switch
+            {
+                ServiceHealth.Healthy => $"{metrics.ServiceName}Healthy",
+                ServiceHealth.Degraded => $"{metrics.ServiceName}Degraded",
+                ServiceHealth.Unhealthy => $"{metrics.ServiceName}Unhealthy",
+                _ => $"{metrics.ServiceName} status unknown"
+            };
+        }
+    }
+
+    public interface IBulkheadPolicy
+    {
+        bool TryAcquireSlot();
+        bool TryAcquireSlot(int timeoutMs);
+        void ReleaseSlot();
+        int AvailableSlots { get; }
+        int MaxSlots { get; }
+        int QueueLength { get; }
+    }
+
+    public class FixedBulkheadPolicy : IBulkheadPolicy
+    {
+        private readonly SemaphoreSlim _semaphore;
+        private readonly ConcurrentQueue<DateTime> _queue = new ConcurrentQueue<DateTime>();
+        private readonly int _maxQueueSize;
+
+        public int AvailableSlots => _semaphore.CurrentCount;
+        public int MaxSlots { get; }
+        public int QueueLength => _queue.Count;
+
+        public FixedBulkheadPolicy(int maxConcurrent, int maxQueueSize = 5)
+        {
+            MaxSlots = maxConcurrent;
+            _semaphore = new SemaphoreSlim(maxConcurrent, maxConcurrent);
+            _maxQueueSize = maxQueueSize;
+        }
+
+        public bool TryAcquireSlot()
+        {
+            return _semaphore.Wait(0);
+        }
+
+        public bool TryAcquireSlot(int timeoutMs)
+        {
+            return _semaphore.Wait(timeoutMs);
+        }
+
+        public void ReleaseSlot()
+        {
+            _semaphore.Release();
+        }
+
+        public void CleanOldQueueItems(TimeSpan maxAge)
+        {
+            while (_queue.TryPeek(out var timestamp) &&
+                   DateTime.Now - timestamp > maxAge)
+            {
+                _queue.TryDequeue(out _);
+            }
+        }
+    }
+
+    public class BulkheadServiceDecorator : IService
+    {
+        private readonly IService _innerService;
+        private readonly IBulkheadPolicy _bulkheadPolicy;
+        private readonly bool _useQueue;
+
+        public string Name => _innerService.Name;
+        public int BaseLatencyMs => _innerService.BaseLatencyMs;
+        public double FailureProbability => _innerService.FailureProbability;
+        public int MaxConcurrentRequests => _bulkheadPolicy.MaxSlots;
+        public int CurrentConcurrentRequests => _bulkheadPolicy.MaxSlots - _bulkheadPolicy.AvailableSlots;
+        public int QueueLength => _bulkheadPolicy.QueueLength;
+
+        public BulkheadServiceDecorator(IService service, IBulkheadPolicy bulkheadPolicy, bool useQueue = true)
+        {
+            _innerService = service;
+            _bulkheadPolicy = bulkheadPolicy;
+            _useQueue = useQueue;
+        }
+
+        public bool CanAcceptRequest()
+        {
+            if (_useQueue)
+            {
+                return _bulkheadPolicy.QueueLength < 5;
+            }
+            return _bulkheadPolicy.AvailableSlots > 0;
+        }
+
+        public Response Process(Request request)
+        {
+            bool acquired = false;
+
+            try
+            {
+                if (_useQueue)
+                {
+                    acquired = _bulkheadPolicy.TryAcquireSlot(100);
+                    if (!acquired && _bulkheadPolicy.QueueLength >= 5)
+                    {
+                        return new Response(false, 0, "Bulkhead_Queue_Full",
+                            $"Queue for {Name} is full (5 requests)", Name, request.TraceId);
+                    }
+                    else if (!acquired)
+                    {
+                        Thread.Sleep(50);
+                        acquired = _bulkheadPolicy.TryAcquireSlot(200);
+                        if (!acquired)
+                        {
+                            return new Response(false, 0, "Bulkhead_Timeout",
+                                $"Timeout waiting for {Name} slot", Name, request.TraceId);
+                        }
+                    }
+                }
+                else
+                {
+                    acquired = _bulkheadPolicy.TryAcquireSlot();
+                    if (!acquired)
+                    {
+                        return new Response(false, 0, "Bulkhead_Full",
+                            $"{Name} reached concurrent limit ({MaxConcurrentRequests})",
+                            Name, request.TraceId);
+                    }
+                }
+
+                return _innerService.Process(request);
+            }
+            finally
+            {
+                if (acquired)
+                {
+                    _bulkheadPolicy.ReleaseSlot();
+                }
+            }
+        }
+    }
+
+    public class ConsoleDashboard
+    {
+        private readonly IMetricsCollector _metricsCollector;
+        private readonly ServiceHealthEvaluator _healthEvaluator;
+        private int _refreshCount = 0;
+
+        public ConsoleDashboard(IMetricsCollector metricsCollector, ServiceHealthEvaluator healthEvaluator)
+        {
+            _metricsCollector = metricsCollector;
+            _healthEvaluator = healthEvaluator;
+        }
+
+        public void DisplayHeader()
+        {
+            Console.Clear();
+            Console.ForegroundColor = ConsoleColor.Cyan;
+            Console.WriteLine("Система мониторинга сервисов (Bulkhead)");
+            Console.ResetColor();
+        }
+
+        public void DisplayMetrics(bool showDetails = false)
+        {
+            _refreshCount++;
+            Console.ForegroundColor = ConsoleColor.Yellow;
+            Console.WriteLine($"\nОбновление #{_refreshCount}");
+            Console.ResetColor();
+
+            var allMetrics = _metricsCollector.GetCurrentMetrics();
+
+            Console.WriteLine("┌─────────────────────────────────────────────────────────────────────────────┐");
+            Console.WriteLine("│ Сервис                      │ Запросы  │ Ошибки │ Задержка      │ Состояние │");
+            Console.WriteLine("│                             │ Усп/Всего│   %    │ Ср/Макс (мс)  │           │");
+            Console.WriteLine("├─────────────────────────────────────────────────────────────────────────────┤");
+
+            foreach (var metrics in allMetrics.OrderBy(m => m.ServiceName))
+            {
+                var health = _healthEvaluator.Evaluate(metrics);
+
+                Console.WriteLine($"│ {metrics.ServiceName,-25} │ {metrics.SuccessfulRequests,4}/{metrics.TotalRequests,-4} │ " +
+                                $"{metrics.ErrorRate,5:F1}% │ {metrics.AverageLatencyMs,4:F0}/{metrics.MaxLatencyMs,-4} │ " +
+                                $"     {health,-8}  │");
+
+                if (showDetails && metrics.BulkheadRejections > 0)
+                {
+                    Console.WriteLine($"│   └ Bulkhead rejections: {metrics.BulkheadRejections,-3} " +
+                                    $"({(double)metrics.BulkheadRejections / metrics.TotalRequests * 100:F1}%)" +
+                                    $"{" ",25}│");
+                }
+            }
+
+            Console.WriteLine("└─────────────────────────────────────────────────────────────────────────────┘");
+
+            DisplayBulkheadInfo();
+        }
+
+        private void DisplayBulkheadInfo()
+        {
+            Console.WriteLine("\nИнформация о Bulkhead");
+            
+            var services = _metricsCollector.GetCurrentMetrics();
+            foreach (var metrics in services)
+            {
+                var service = (_metricsCollector as InMemoryMetricsCollector)?.GetService(metrics.ServiceName);
+                if (service != null)
+                {
+                    Console.WriteLine($"{metrics.ServiceName}:");
+                    Console.WriteLine($"• Лимит параллелизма: {service.MaxConcurrentRequests}");
+                    Console.WriteLine($"• Текущая нагрузка: {service.CurrentConcurrentRequests}/{service.MaxConcurrentRequests}");
+                    if (service is BulkheadServiceDecorator bulkheadService)
+                    {
+                        Console.WriteLine($"• Длина очереди: {bulkheadService.QueueLength}");
+                    }
+                }
+            }
+        }
+
+        public void DisplayFinalReport()
+        {
+            Console.ForegroundColor = ConsoleColor.Green;
+            Console.WriteLine("\nИтоговый отчет");
+            Console.ResetColor();
+
+            var allMetrics = _metricsCollector.GetCurrentMetrics();
+            int totalRequests = allMetrics.Sum(m => m.TotalRequests);
+            int totalSuccessful = allMetrics.Sum(m => m.SuccessfulRequests);
+            int totalBulkheadRejections = allMetrics.Sum(m => m.BulkheadRejections);
+            double overallErrorRate = totalRequests > 0 ?
+                (double)(totalRequests - totalSuccessful) / totalRequests * 100 : 0;
+
+            Console.WriteLine($"Общая статистика:");
+            Console.WriteLine($"• Всего запросов: {totalRequests}");
+            Console.WriteLine($"• Успешных: {totalSuccessful} ({100 - overallErrorRate:F1}%)");
+            Console.WriteLine($"• Ошибок: {totalRequests - totalSuccessful} ({overallErrorRate:F1}%)");
+            Console.WriteLine($"• Отклонений Bulkhead: {totalBulkheadRejections} " +
+                            $"({(double)totalBulkheadRejections / totalRequests * 100:F1}%)");
+
+            Console.WriteLine($"\nСостояние сервисов:");
+            foreach (var metrics in allMetrics)
+            {
+                var health = _healthEvaluator.Evaluate(metrics);
+                Console.WriteLine($"• {metrics.ServiceName}: {health} " +
+                                $"(ошибки: {metrics.ErrorRate:F1}%, задержка: {metrics.AverageLatencyMs:F0}мс)");
+            }
+        }
+    }
+
+    public class Program
+    {
+        public static void Main(string[] args)
+        {
+            try
+            {
+                var fastService = CreateServiceWithBulkhead("FastService", 50, 0.05, 2);
+                var slowService = CreateServiceWithBulkhead("SlowService", 200, 0.15, 1);
+                var balancedService = CreateServiceWithBulkhead("BalancedService", 100, 0.08, 3);
+
+                IMetricsCollector metricsCollector = new InMemoryMetricsCollector();
+                metricsCollector.RegisterService(fastService);
+                metricsCollector.RegisterService(slowService);
+                metricsCollector.RegisterService(balancedService);
+
+                ServiceHealthEvaluator healthEvaluator = new ServiceHealthEvaluator();
+                var dashboard = new ConsoleDashboard(metricsCollector, healthEvaluator);
+                dashboard.DisplayHeader();
+
+                var random = new Random();
+                var requests = GenerateRequests(80, random);
+
+                Console.WriteLine($"Сгенерировано {requests.Count} запросов...\n");
+                Console.WriteLine("Нажмите Enter для начала моделирования...");
+                Console.ReadLine();
+
+                int requestCount = 0;
+                foreach (var request in requests)
+                {
+                    requestCount++;
+
+                    IService service = request.ServiceName switch
+                    {
+                        "FastService" => fastService,
+                        "SlowService" => slowService,
+                        "BalancedService" => balancedService,
+                        _ => fastService
+                    };
+
+                    var response = service.Process(request);
+                    metricsCollector.Record(request, response);
+
+                    if (requestCount % 10 == 0 || requestCount == requests.Count)
+                    {
+                        dashboard.DisplayMetrics(requestCount % 20 == 0);
+                        Thread.Sleep(500);
+                    }
+
+                    Thread.Sleep(random.Next(10, 50));
+                }
+
+                dashboard.DisplayFinalReport();
+            }
+            catch (Exception ex)
+            {
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine($"Ошибка: {ex.Message}");
+                Console.WriteLine(ex.StackTrace);
+                Console.ResetColor();
+            }
+
+            Console.WriteLine("\nНажмите любую клавишу для выхода...");
+            Console.ReadKey();
+        }
+
+        private static IService CreateServiceWithBulkhead(string name, int latency, double failureProb, int maxConcurrent)
+        {
+            ServiceBase baseService = name switch
+            {
+                "FastService" => new FastService(),
+                "SlowService" => new SlowService(),
+                "BalancedService" => new BalancedService(),
+                _ => new BalancedService()
+            };
+
+            var bulkheadPolicy = new FixedBulkheadPolicy(maxConcurrent, maxQueueSize: 3);
+            return new BulkheadServiceDecorator(baseService, bulkheadPolicy, useQueue: true);
+        }
+
+        private static List<Request> GenerateRequests(int count, Random random)
+        {
+            var requests = new List<Request>();
+            var serviceNames = new[] { "FastService", "SlowService", "BalancedService" };
+
+            for (int i = 0; i < count; i++)
+            {
+                string serviceName = serviceNames[random.Next(serviceNames.Length)];
+                int payloadSize = random.Next(10, 1000);
+                int? deadline = random.Next(5) == 0 ? random.Next(100, 500) : (int?)null;
+                int priority = random.Next(1, 4);
+
+                requests.Add(new Request(serviceName, payloadSize, deadline, priority));
+            }
+
+            return requests;
+        }
+    }
+}
